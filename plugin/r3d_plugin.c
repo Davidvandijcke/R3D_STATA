@@ -64,8 +64,8 @@ STDLL stata_call(int argc, char *argv[])
     kernel_type = atoi(argv[4]);
     nq = atoi(argv[5]);
     
-    if (nq <= 0 || nq > 100) {
-        SF_error("r3d_plugin: number of quantiles must be between 1 and 100\n");
+    if (nq <= 0 || nq > 500) {
+        SF_error("r3d_plugin: number of quantiles must be between 1 and 500\n");
         return 198;
     }
     
