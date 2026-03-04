@@ -1,0 +1,33 @@
+# Compiled objects
+*.o
+*.so
+*.dll
+*.plugin
+*.mod
+
+# Stata logs and temp files
+*.log
+*.stswp
+*.smcl
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# Editor files
+*~
+*.swp
+*.swo
+
+# Backup files
+*_backup
+*_broken.*
+
+# IDE
+.claude/
+.vscode/
