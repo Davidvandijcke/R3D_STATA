@@ -25,10 +25,10 @@
 {synopt:{opt c:utoff(#)}}specifies the RD cutoff value{p_end}
 {synopt:{opt m:ethod(string)}}bandwidth selection method: {cmd:simple} (default) or {cmd:frechet}{p_end}
 {synopt:{opt fuz:zy(varname)}}treatment variable for fuzzy RD{p_end}
-{synopt:{opt pol:ynomial(#)}}polynomial order; default is 1{p_end}
+{synopt:{opt pol:ynomial(#)}}polynomial order; default is 2{p_end}
 {synopt:{opt k:ernel(string)}}kernel function: {cmd:triangular} (default), {cmd:epanechnikov}, or {cmd:uniform}{p_end}
 {synopt:{opt q:uantiles(numlist)}}specific quantiles to evaluate{p_end}
-{synopt:{opt nq:uantiles(#)}}number of equally-spaced quantiles; default is 100{p_end}
+{synopt:{opt nq:uantiles(#)}}number of equally-spaced quantiles; default is 99{p_end}
 {synopt:{opt bwg:rid(numlist)}}bandwidth grid for search{p_end}
 {synopt:{opt w:eights(varname)}}weights for observations{p_end}
 {synopt:{opt ver:bose}}display detailed output{p_end}
@@ -59,7 +59,7 @@ aggregation. Default is {cmd:simple}.
 {opt fuzzy(varname)} specifies the treatment variable for fuzzy RD designs.
 
 {phang}
-{opt polynomial(#)} specifies the order of the local polynomial. Default is 1.
+{opt polynomial(#)} specifies the order of the local polynomial. Default is 2.
 
 {phang}
 {opt kernel(string)} specifies the kernel function. Options are {cmd:triangular}
@@ -70,7 +70,7 @@ aggregation. Default is {cmd:simple}.
 bandwidth selection.
 
 {phang}
-{opt nquantiles(#)} specifies the number of equally-spaced quantiles. Default is 100.
+{opt nquantiles(#)} specifies the number of equally-spaced quantiles. Default is 99.
 
 {phang}
 {opt bwgrid(numlist)} specifies the bandwidth grid for the search procedure.
