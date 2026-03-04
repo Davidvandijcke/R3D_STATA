@@ -41,8 +41,10 @@ R3D_STATA/
 │   ├── r3d.sthlp                 # Main command help
 │   ├── r3d_bootstrap.sthlp       # Bootstrap help
 │   └── r3d_bwselect.sthlp        # Bandwidth selection help
-├── tests/                        # Test suite
-│   └── (to be populated)
+├── tests/                        # Equivalence test suite
+│   ├── generate_reference_data.R # R script generating reference outputs (seed=42)
+│   ├── test_equivalence_core.do  # Stata comparison: sharp, fuzzy, simple, frechet
+│   └── ref_*.csv                 # Reference data and results from R
 ├── example.do                    # End-to-end usage example
 ├── diagnose_plugin.do            # Plugin loading diagnostic
 ├── install_r3d.do                # Local installation script
@@ -50,6 +52,7 @@ R3D_STATA/
 ├── stata.toc                     # Package index
 ├── r3d.pkg                       # Package manifest
 ├── r3d.ancillary                 # Ancillary file list
+├── README.md                     # Installation, usage, documentation
 ├── LICENSE                       # MIT License
 └── CLAUDE.md                     # AI assistant context
 ```

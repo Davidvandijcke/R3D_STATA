@@ -28,14 +28,14 @@
 {synopt:{opt c:utoff(#)}}specifies the RD cutoff value{p_end}
 {synopt:{opt m:ethod(string)}}estimation method: {cmd:simple} (default) or {cmd:frechet}{p_end}
 {synopt:{opt fuz:zy(varname)}}treatment variable for fuzzy RD{p_end}
-{synopt:{opt pol:ynomial(#)}}polynomial order for local regression (default is 1){p_end}
+{synopt:{opt pol:ynomial(#)}}polynomial order for local regression (default is 2){p_end}
 {synopt:{opt b:andwidth(numlist)}}bandwidth(s) for local regression{p_end}
 {synopt:{opt bws:elect}}perform data-driven bandwidth selection{p_end}
 {synopt:{opt k:ernel(string)}}kernel function: {cmd:triangular} (default), {cmd:epanechnikov}, or {cmd:uniform}{p_end}
 
 {syntab:Quantiles}
 {synopt:{opt q:uantiles(numlist)}}specific quantiles to evaluate (between 0 and 1){p_end}
-{synopt:{opt nq:uantiles(#)}}number of equally-spaced quantiles (default is 100){p_end}
+{synopt:{opt nq:uantiles(#)}}number of equally-spaced quantiles (default is 99){p_end}
 
 {syntab:Inference}
 {synopt:{opt boot:strap(#)}}number of bootstrap replications for inference{p_end}
@@ -92,7 +92,7 @@ If not specified, sharp RD is assumed.
 
 {phang}
 {opt polynomial(#)} specifies the order of the local polynomial. The default
-is 1 (local linear regression).
+is 2 (local quadratic regression).
 
 {phang}
 {opt bandwidth(numlist)} specifies the bandwidth(s) for local regression.
