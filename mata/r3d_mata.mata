@@ -1,18 +1,17 @@
 /*
  * r3d_mata.mata - Core Mata functions for R3D package
  * Implements regression discontinuity with distributional outcomes
+ *
+ * Changes from original:
+ *   - matastrict on (all declarations at function top)
+ *   - r3d_locpoly: proper intercept weights e_1'(X'WX)^{-1} * basis * K
+ *   - r3d_compute_quantiles: R type-7 interpolation
+ *   - r3d_estimate_density: h = 1.06 * sd * n^(-1/5) (no IQR)
  */
 
 version 18.0
 mata:
-mata set matastrict off
-
-// ============================================================================
-// PLUGIN INTERFACE
-// ============================================================================
-
-// Forward declarations for plugin interface (defined in r3d_plugin_interface.mata)
-// These are external functions that will be compiled separately
+mata set matastrict on
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -43,17 +42,19 @@ real scalar r3d_variance(real colvector x)
 }
 
 // ============================================================================
-// QUANTILE COMPUTATION
+// QUANTILE COMPUTATION (R type-7 interpolation)
 // ============================================================================
 
 // Compute empirical quantiles from distribution data
+// Uses R's type-7 quantile algorithm: h = (k-1)*p + 1, linear interpolation
 void r3d_compute_quantiles(string scalar yvars, string scalar quantiles_str,
                           string scalar touse, string scalar matname,
                           string scalar weightvar)
 {
-    real matrix Y, Q
-    real colvector q_grid, w
-    real scalar i, j, n, nq, ny
+    real matrix Y, Q, sorted
+    real colvector q_grid, w, cumw
+    real rowvector yi, wi
+    real scalar i, j, n, nq, ny, k, idx_lo, idx_hi, hh, frac
     string rowvector varlist
 
     // Parse variable list
@@ -82,38 +83,45 @@ void r3d_compute_quantiles(string scalar yvars, string scalar quantiles_str,
     // Compute quantiles for each observation
     for (i = 1; i <= n; i++) {
         // Get non-missing values for this observation
-        real rowvector yi, wi
-        real scalar k
-
         yi = select(Y[i,], Y[i,] :< .)
         k = cols(yi)
 
         if (k > 0) {
-            // Create weights for this observation's values
             if (weightvar != "") {
-                wi = J(1, k, w[i]/k)  // Equal weight within observation
+                // Weighted quantiles: use cumulative weight approach
+                wi = J(1, k, w[i]/k)
+                sorted = sort((yi' , wi'), 1)
+                cumw = runningsum(sorted[,2])
+                cumw = cumw / cumw[k]
+
+                for (j = 1; j <= nq; j++) {
+                    // Find index where cumulative weight exceeds quantile
+                    for (idx_lo = 1; idx_lo <= k; idx_lo++) {
+                        if (cumw[idx_lo] >= q_grid[j]) break
+                    }
+                    if (idx_lo > k) idx_lo = k
+                    Q[i,j] = sorted[idx_lo,1]
+                }
             }
             else {
-                wi = J(1, k, 1/k)
-            }
-
-            // Sort values and weights together
-            real matrix sorted
-            sorted = sort((yi' , wi'), 1)
-
-            // Compute weighted quantiles
-            real colvector cumw
-            cumw = runningsum(sorted[,2])
-            cumw = cumw / cumw[k]  // Normalize
-
-            for (j = 1; j <= nq; j++) {
-                real scalar idx
-                // Find index where cumulative weight exceeds quantile
-                for (idx = 1; idx <= k; idx++) {
-                    if (cumw[idx] >= q_grid[j]) break
+                // Unweighted: R type-7 interpolation
+                // Sort values
+                sorted = sort(yi', 1)
+                for (j = 1; j <= nq; j++) {
+                    // R type-7: h = (k - 1) * p + 1
+                    hh = (k - 1) * q_grid[j] + 1
+                    idx_lo = floor(hh)
+                    idx_hi = ceil(hh)
+                    if (idx_lo < 1) idx_lo = 1
+                    if (idx_hi > k) idx_hi = k
+                    if (idx_lo == idx_hi) {
+                        Q[i,j] = sorted[idx_lo]
+                    }
+                    else {
+                        frac = hh - idx_lo
+                        Q[i,j] = sorted[idx_lo] * (1 - frac) + sorted[idx_hi] * frac
+                    }
                 }
-                if (idx > k) idx = k
-                Q[i,j] = sorted[idx,1]
             }
         }
     }
@@ -126,40 +134,21 @@ void r3d_compute_quantiles(string scalar yvars, string scalar quantiles_str,
 // BANDWIDTH SELECTION
 // ============================================================================
 
-// Estimate density at cutoff using Silverman's rule with selected kernel
+// Estimate density at cutoff: h = 1.06 * sd * n^(-1/5) (matches R)
 real scalar r3d_estimate_density(real colvector X, real scalar kernel_type)
 {
-    real scalar n, h, f_hat
-    real colvector X_centered
+    real scalar n, h, f_hat, sd_x, i
+    real colvector K
 
     n = rows(X)
-    X_centered = X :- 0  // Already centered at cutoff
-
-    // Silverman's rule for bandwidth
-    real scalar iqr, sd, q25, q75
-    real colvector X_sorted
-    X_sorted = sort(X_centered, 1)
-    q25 = X_sorted[ceil(0.25*n)]
-    q75 = X_sorted[ceil(0.75*n)]
-    iqr = q75 - q25
-    sd = sqrt(r3d_variance(X_centered))
-    real scalar scale
-    scale = sd
-    if (iqr > 0) {
-        real scalar alt
-        alt = iqr/1.349
-        if (alt < scale) scale = alt
-    }
-    if (scale <= 0) scale = sd
-    if (scale <= 0) scale = 1
-    h = 1.06 * scale * n^(-0.2)
+    sd_x = sqrt(r3d_variance(X))
+    if (sd_x <= 0) sd_x = 1
+    h = 1.06 * sd_x * n^(-0.2)
 
     // Estimate density at zero
-    real colvector K
     K = J(n, 1, 0)
-    real scalar i
     for (i = 1; i <= n; i++) {
-        K[i] = r3d_kernel(X_centered[i] / h, kernel_type)
+        K[i] = r3d_kernel(X[i] / h, kernel_type)
     }
     f_hat = mean(K) / h
 
@@ -172,8 +161,9 @@ void r3d_kernel_matrices(real scalar s, real scalar kernel_type,
                          real colvector Lambda_plus, real colvector Lambda_minus,
                          real matrix Psi_plus, real matrix Psi_minus)
 {
-    real scalar m, step, i, j, dim
+    real scalar m, step, i, j, dim, u, k_val
     real rowvector grid
+    real colvector basis
 
     dim = s + 1
     m = 1000
@@ -188,9 +178,6 @@ void r3d_kernel_matrices(real scalar s, real scalar kernel_type,
     Lambda_minus = J(dim, 1, 0)
 
     for (i = 1; i <= m; i++) {
-        real scalar u, k_val
-        real colvector basis
-
         u = grid[i]
         k_val = r3d_kernel(u, kernel_type)
         if (k_val <= 0) continue
@@ -217,8 +204,9 @@ void r3d_kernel_matrices(real scalar s, real scalar kernel_type,
 real rowvector r3d_fit_global_poly(real colvector Y, real colvector X, real scalar order,
                                   real scalar resid_var)
 {
-    real matrix Xpoly
-    real colvector coefs
+    real matrix Xpoly, XtX
+    real colvector coefs, resid
+    real rowvector derivs
     real scalar i, n
 
     n = rows(X)
@@ -230,14 +218,12 @@ real rowvector r3d_fit_global_poly(real colvector Y, real colvector X, real scal
     }
 
     // Fit via OLS
-    real rowvector derivs
     if (hasmissing(Y) | hasmissing(X)) {
         derivs = J(1, order, 0)
         resid_var = 1
         return(derivs)
     }
 
-    real matrix XtX
     XtX = cross(Xpoly, Xpoly)
 
     if (det(XtX) != 0) {
@@ -252,7 +238,6 @@ real rowvector r3d_fit_global_poly(real colvector Y, real colvector X, real scal
         }
 
         // Compute residual variance
-        real colvector resid
         resid = Y - Xpoly * coefs
         resid_var = r3d_variance(resid)
     }
@@ -273,7 +258,48 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
                           string scalar weightvar)
 {
     real matrix X, Q, T
-    real rowvector q_grid
+    real rowvector q_grid, derivs_plus, derivs_minus, deriv_T_plus, deriv_T_minus
+    real scalar n, nq, sigma_X, f_X_hat, j, order_pilot, factorial_term
+    real matrix Gamma_plus, Gamma_minus, Psi_plus, Psi_minus
+    real colvector Lambda_plus, Lambda_minus
+    real matrix I_s, Gamma_plus_inv, Gamma_minus_inv
+    real colvector idx_plus, idx_minus
+    real colvector pilot_derivs_plus, pilot_derivs_minus
+    real colvector pilot_vars_plus, pilot_vars_minus
+    real colvector Y_plus, X_plus, Y_minus, X_minus
+    real scalar var_plus, var_minus
+    real scalar pilot_deriv_T_plus, pilot_deriv_T_minus
+    real scalar pilot_var_T_plus, pilot_var_T_minus
+    real colvector T_plus, T_minus
+    real scalar var_T_plus, var_T_minus
+    real colvector e0, pilot_h_num
+    real scalar bias_plus, bias_minus, C_1_0, C_1_0_prime
+    real colvector temp_plus, temp_minus
+    real scalar var_plus_j, var_minus_j, ratio
+    real scalar pilot_h_den
+    real scalar bias_T_plus, bias_T_minus, C_T_0, C_T_0_prime
+    real colvector temp_plus_T, temp_minus_T
+    real scalar var_T_plus_calc, var_T_minus_calc, ratio_T
+    real matrix alpha_plus_pilot, alpha_minus_pilot, w_plus_pilot, w_minus_pilot
+    real matrix h_pilot_vec
+    real scalar h_scalar
+    real scalar rc_plus, rc_minus
+    real matrix alphaT_plus_pilot, alphaT_minus_pilot, wT_plus_pilot, wT_minus_pilot
+    real matrix h_den_vec
+    real scalar rc_tplus, rc_tminus
+    real colvector B_plus, B_minus, V_plus, V_minus
+    real scalar h_use, weight_sum, k
+    real colvector idxp, idxm
+    real colvector Xscaled, fitted_vals, resid_vals
+    real matrix basis_mat
+    real scalar B_plus_den, B_minus_den, V_plus_den, V_minus_den
+    real colvector idxp_den, idxm_den
+    real scalar weight_sum_den, k_den
+    real colvector h_star_num
+    real scalar bias_diff, var_sum
+    real scalar dq, A_s, B_s, h_val
+    real scalar h_star_den, bias_diff_den, var_sum_den, ratio_den
+    real scalar shrink
 
     st_view(X, ., xvar, touse)
     Q = st_matrix(Qmat)
@@ -289,7 +315,6 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         error(498)
     }
 
-    real scalar n, nq
     n = rows(X)
     nq = cols(Q)
 
@@ -297,78 +322,57 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         st_view(T, ., tvar, touse)
     }
 
-    real scalar sigma_X, f_X_hat
     sigma_X = sqrt(r3d_variance(X))
     if (sigma_X <= 0) sigma_X = 1
     f_X_hat = r3d_estimate_density(X, kernel_type)
     if (f_X_hat <= 0) f_X_hat = 1
 
-    real matrix Gamma_plus, Gamma_minus, Psi_plus, Psi_minus
-    real colvector Lambda_plus, Lambda_minus
     r3d_kernel_matrices(s, kernel_type, Gamma_plus, Gamma_minus,
         Lambda_plus, Lambda_minus, Psi_plus, Psi_minus)
 
-    real matrix I_s
     I_s = I(s+1)
     if (abs(det(Gamma_plus)) < 1e-10)  Gamma_plus  = Gamma_plus  + 1e-8 * I_s
     if (abs(det(Gamma_minus)) < 1e-10) Gamma_minus = Gamma_minus + 1e-8 * I_s
 
-    real matrix Gamma_plus_inv, Gamma_minus_inv
     Gamma_plus_inv = invsym(Gamma_plus)
     Gamma_minus_inv = invsym(Gamma_minus)
 
-    real colvector idx_plus, idx_minus
     idx_plus = (X :>= 0)
     idx_minus = (X :< 0)
 
-    real colvector pilot_derivs_plus, pilot_derivs_minus
-    real colvector pilot_vars_plus, pilot_vars_minus
     pilot_derivs_plus = J(nq, 1, 0)
     pilot_derivs_minus = J(nq, 1, 0)
     pilot_vars_plus = J(nq, 1, 1)
     pilot_vars_minus = J(nq, 1, 1)
 
-    real scalar order_pilot
     order_pilot = s + 1
 
-    real scalar j
     for (j = 1; j <= nq; j++) {
-        real colvector Y_plus, X_plus
         Y_plus = select(Q[,j], idx_plus)
         X_plus = select(X, idx_plus)
         if (rows(Y_plus) > order_pilot) {
-            real scalar var_plus
-            real rowvector derivs_plus
             derivs_plus = r3d_fit_global_poly(Y_plus, X_plus, order_pilot, var_plus)
             if (cols(derivs_plus) >= order_pilot) pilot_derivs_plus[j] = derivs_plus[order_pilot]
             pilot_vars_plus[j] = var_plus
         }
 
-        real colvector Y_minus, X_minus
         Y_minus = select(Q[,j], idx_minus)
         X_minus = select(X, idx_minus)
         if (rows(Y_minus) > order_pilot) {
-            real scalar var_minus
-            real rowvector derivs_minus
             derivs_minus = r3d_fit_global_poly(Y_minus, X_minus, order_pilot, var_minus)
             if (cols(derivs_minus) >= order_pilot) pilot_derivs_minus[j] = derivs_minus[order_pilot]
             pilot_vars_minus[j] = var_minus
         }
     }
 
-    real scalar pilot_deriv_T_plus, pilot_deriv_T_minus
-    real scalar pilot_var_T_plus, pilot_var_T_minus
     pilot_deriv_T_plus = 0
     pilot_deriv_T_minus = 0
     pilot_var_T_plus = 1
     pilot_var_T_minus = 1
 
     if (is_fuzzy) {
-        real colvector T_plus, T_minus
         T_plus = select(T, idx_plus)
         if (rows(T_plus) > order_pilot) {
-            real scalar var_T_plus
-            real rowvector deriv_T_plus
             deriv_T_plus = r3d_fit_global_poly(T_plus, X_plus, order_pilot, var_T_plus)
             if (cols(deriv_T_plus) >= order_pilot) pilot_deriv_T_plus = deriv_T_plus[order_pilot]
             pilot_var_T_plus = var_T_plus
@@ -376,34 +380,23 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
 
         T_minus = select(T, idx_minus)
         if (rows(T_minus) > order_pilot) {
-            real scalar var_T_minus
-            real rowvector deriv_T_minus
             deriv_T_minus = r3d_fit_global_poly(T_minus, X_minus, order_pilot, var_T_minus)
             if (cols(deriv_T_minus) >= order_pilot) pilot_deriv_T_minus = deriv_T_minus[order_pilot]
             pilot_var_T_minus = var_T_minus
         }
     }
 
-    real colvector e0
     e0 = J(s+1, 1, 0)
     e0[1] = 1
 
-    real colvector pilot_h_num
     pilot_h_num = J(nq, 1, 0)
-
-    real scalar factorial_term
     factorial_term = factorial(s + 1)
 
     for (j = 1; j <= nq; j++) {
-        real scalar bias_plus, bias_minus, C_1_0
-        real scalar C_1_0_prime
-
         bias_plus = (e0' * (Gamma_plus_inv * Lambda_plus)) * (pilot_derivs_plus[j] / factorial_term)
         bias_minus = (e0' * (Gamma_minus_inv * Lambda_minus)) * (pilot_derivs_minus[j] / factorial_term)
         C_1_0 = bias_plus - bias_minus
 
-        real colvector temp_plus, temp_minus
-        real scalar var_plus_j, var_minus_j
         temp_plus = Gamma_plus_inv * e0
         temp_minus = Gamma_minus_inv * e0
 
@@ -412,7 +405,6 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         C_1_0_prime = (var_plus_j + var_minus_j) / f_X_hat
 
         if (abs(C_1_0) > 1e-14 && C_1_0_prime > 0) {
-            real scalar ratio
             ratio = C_1_0_prime / (2 * (s + 1) * (C_1_0^2))
             pilot_h_num[j] = ratio^(1 / (2 * s + 3)) * n^(-1 / (2 * s + 3))
         }
@@ -422,27 +414,20 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         }
     }
 
-    real scalar pilot_h_den
     pilot_h_den = .
     if (is_fuzzy) {
-        real scalar bias_T_plus, bias_T_minus, C_T_0
-        real scalar C_T_0_prime
-
         bias_T_plus = (e0' * (Gamma_plus_inv * Lambda_plus)) * (pilot_deriv_T_plus / factorial_term)
         bias_T_minus = (e0' * (Gamma_minus_inv * Lambda_minus)) * (pilot_deriv_T_minus / factorial_term)
         C_T_0 = bias_T_plus - bias_T_minus
 
-        real colvector temp_plus_T, temp_minus_T
         temp_plus_T = Gamma_plus_inv * e0
         temp_minus_T = Gamma_minus_inv * e0
 
-        real scalar var_T_plus_calc, var_T_minus_calc
         var_T_plus_calc = pilot_var_T_plus * (temp_plus_T' * (Psi_plus * temp_plus_T))
         var_T_minus_calc = pilot_var_T_minus * (temp_minus_T' * (Psi_minus * temp_minus_T))
         C_T_0_prime = (var_T_plus_calc + var_T_minus_calc) / f_X_hat
 
         if (abs(C_T_0) > 1e-14 && C_T_0_prime > 0) {
-            real scalar ratio_T
             ratio_T = C_T_0_prime / (2 * (s + 1) * (C_T_0^2))
             pilot_h_den = ratio_T^(1 / (2 * s + 3)) * n^(-1 / (2 * s + 3))
         }
@@ -452,19 +437,15 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         }
     }
 
-    real matrix alpha_plus_pilot, alpha_minus_pilot, w_plus_pilot, w_minus_pilot
-    real matrix h_pilot_vec
     h_pilot_vec = pilot_h_num
 
     if (method == "frechet") {
-        real scalar h_scalar
         h_scalar = mean(h_pilot_vec)
         if (!(h_scalar > 0)) h_scalar = 1.06 * sigma_X * n^(-1 / (2 * s + 1))
         h_pilot_vec = J(nq, 1, h_scalar)
     }
 
     if (r3d_plugin_available()) {
-        real scalar rc_plus, rc_minus
         rc_plus = r3d_plugin_locweights(X, Q, h_pilot_vec, s, kernel_type, 1, alpha_plus_pilot, w_plus_pilot)
         rc_minus = r3d_plugin_locweights(X, Q, h_pilot_vec, s, kernel_type, 0, alpha_minus_pilot, w_minus_pilot)
         if (rc_plus != 0 | rc_minus != 0) {
@@ -479,13 +460,10 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         r3d_locpoly(X, Q, h_pilot_vec, s, kernel_type, 0, alpha_minus_pilot, w_minus_pilot)
     }
 
-    real matrix alphaT_plus_pilot, alphaT_minus_pilot, wT_plus_pilot, wT_minus_pilot
     if (is_fuzzy) {
-        real matrix h_den_vec
         h_den_vec = J(1, 1, pilot_h_den)
 
         if (r3d_plugin_available()) {
-            real scalar rc_tplus, rc_tminus
             rc_tplus = r3d_plugin_locweights(X, T, h_den_vec, s, kernel_type, 1, alphaT_plus_pilot, wT_plus_pilot)
             rc_tminus = r3d_plugin_locweights(X, T, h_den_vec, s, kernel_type, 0, alphaT_minus_pilot, wT_minus_pilot)
             if (rc_tplus != 0 | rc_tminus != 0) {
@@ -501,7 +479,6 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         }
     }
 
-    real colvector B_plus, B_minus, V_plus, V_minus
     B_plus = J(nq, 1, 0)
     B_minus = J(nq, 1, 0)
     V_plus = J(nq, 1, 0)
@@ -511,43 +488,33 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         B_plus[j] = alpha_plus_pilot[s+1, j] / factorial_term
         B_minus[j] = alpha_minus_pilot[s+1, j] / factorial_term
 
-        real scalar h_use, weight_sum, k
         h_use = h_pilot_vec[j,1]
         if (!(h_use > 0)) continue
 
-        real colvector idxp, idxm
         idxp = (w_plus_pilot[,j] :> 0)
         idxm = (w_minus_pilot[,j] :> 0)
 
         if (sum(idxp) > 0) {
-            real colvector Xscaled_p
-            real matrix basis_p
-            real colvector fitted_p, resid_p
-
-            Xscaled_p = select(X, idxp) / h_use
-            basis_p = J(rows(Xscaled_p), s+1, 1)
-            for (k = 2; k <= s+1; k++) basis_p[,k] = basis_p[,k-1] :* Xscaled_p
-            fitted_p = basis_p * alpha_plus_pilot[,j]
-            resid_p = select(Q[,j], idxp) - fitted_p
+            Xscaled = select(X, idxp) / h_use
+            basis_mat = J(rows(Xscaled), s+1, 1)
+            for (k = 2; k <= s+1; k++) basis_mat[,k] = basis_mat[,k-1] :* Xscaled
+            fitted_vals = basis_mat * alpha_plus_pilot[,j]
+            resid_vals = select(Q[,j], idxp) - fitted_vals
             weight_sum = sum(select(w_plus_pilot[,j], idxp))
-            if (weight_sum > 0) V_plus[j] = sum(select(w_plus_pilot[,j], idxp) :* (resid_p:^2)) / weight_sum
+            if (weight_sum > 0) V_plus[j] = sum(select(w_plus_pilot[,j], idxp) :* (resid_vals:^2)) / weight_sum
         }
 
         if (sum(idxm) > 0) {
-            real colvector Xscaled_m
-            real matrix basis_m
-            real colvector fitted_m, resid_m
-            Xscaled_m = select(X, idxm) / h_use
-            basis_m = J(rows(Xscaled_m), s+1, 1)
-            for (k = 2; k <= s+1; k++) basis_m[,k] = basis_m[,k-1] :* Xscaled_m
-            fitted_m = basis_m * alpha_minus_pilot[,j]
-            resid_m = select(Q[,j], idxm) - fitted_m
+            Xscaled = select(X, idxm) / h_use
+            basis_mat = J(rows(Xscaled), s+1, 1)
+            for (k = 2; k <= s+1; k++) basis_mat[,k] = basis_mat[,k-1] :* Xscaled
+            fitted_vals = basis_mat * alpha_minus_pilot[,j]
+            resid_vals = select(Q[,j], idxm) - fitted_vals
             weight_sum = sum(select(w_minus_pilot[,j], idxm))
-            if (weight_sum > 0) V_minus[j] = sum(select(w_minus_pilot[,j], idxm) :* (resid_m:^2)) / weight_sum
+            if (weight_sum > 0) V_minus[j] = sum(select(w_minus_pilot[,j], idxm) :* (resid_vals:^2)) / weight_sum
         }
     }
 
-    real scalar B_plus_den, B_minus_den, V_plus_den, V_minus_den
     B_plus_den = 0
     B_minus_den = 0
     V_plus_den = 0
@@ -557,50 +524,37 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         B_plus_den = alphaT_plus_pilot[s+1,1] / factorial_term
         B_minus_den = alphaT_minus_pilot[s+1,1] / factorial_term
 
-        real colvector idxp_den, idxm_den
-        real scalar weight_sum_den, k_den
         idxp_den = (wT_plus_pilot :> 0)
         idxm_den = (wT_minus_pilot :> 0)
 
         if (sum(idxp_den) > 0) {
-            real colvector Xscaled_p
-            real matrix basis_p
-            real colvector fitted_p, resid_p
-
-            Xscaled_p = select(X, idxp_den) / pilot_h_den
-            basis_p = J(rows(Xscaled_p), s+1, 1)
-            for (k_den = 2; k_den <= s+1; k_den++) basis_p[,k_den] = basis_p[,k_den-1] :* Xscaled_p
-            fitted_p = basis_p * alphaT_plus_pilot
-            resid_p = select(T, idxp_den) - fitted_p
+            Xscaled = select(X, idxp_den) / pilot_h_den
+            basis_mat = J(rows(Xscaled), s+1, 1)
+            for (k_den = 2; k_den <= s+1; k_den++) basis_mat[,k_den] = basis_mat[,k_den-1] :* Xscaled
+            fitted_vals = basis_mat * alphaT_plus_pilot
+            resid_vals = select(T, idxp_den) - fitted_vals
             weight_sum_den = sum(select(wT_plus_pilot, idxp_den))
-            if (weight_sum_den > 0) V_plus_den = sum(select(wT_plus_pilot, idxp_den) :* (resid_p:^2)) / weight_sum_den
+            if (weight_sum_den > 0) V_plus_den = sum(select(wT_plus_pilot, idxp_den) :* (resid_vals:^2)) / weight_sum_den
         }
 
         if (sum(idxm_den) > 0) {
-            real colvector Xscaled_m
-            real matrix basis_m
-            real colvector fitted_m, resid_m
-
-            Xscaled_m = select(X, idxm_den) / pilot_h_den
-            basis_m = J(rows(Xscaled_m), s+1, 1)
-            for (k_den = 2; k_den <= s+1; k_den++) basis_m[,k_den] = basis_m[,k_den-1] :* Xscaled_m
-            fitted_m = basis_m * alphaT_minus_pilot
-            resid_m = select(T, idxm_den) - fitted_m
+            Xscaled = select(X, idxm_den) / pilot_h_den
+            basis_mat = J(rows(Xscaled), s+1, 1)
+            for (k_den = 2; k_den <= s+1; k_den++) basis_mat[,k_den] = basis_mat[,k_den-1] :* Xscaled
+            fitted_vals = basis_mat * alphaT_minus_pilot
+            resid_vals = select(T, idxm_den) - fitted_vals
             weight_sum_den = sum(select(wT_minus_pilot, idxm_den))
-            if (weight_sum_den > 0) V_minus_den = sum(select(wT_minus_pilot, idxm_den) :* (resid_m:^2)) / weight_sum_den
+            if (weight_sum_den > 0) V_minus_den = sum(select(wT_minus_pilot, idxm_den) :* (resid_vals:^2)) / weight_sum_den
         }
     }
 
-    real colvector h_star_num
     h_star_num = J(nq, 1, 0)
 
     if (method == "simple") {
         for (j = 1; j <= nq; j++) {
-            real scalar bias_diff, var_sum
             bias_diff = B_plus[j] - B_minus[j]
             var_sum = (V_plus[j] + V_minus[j]) / f_X_hat
             if (abs(bias_diff) > 1e-14 && var_sum > 0) {
-                real scalar ratio
                 ratio = var_sum / (2 * (s + 1) * (bias_diff^2))
                 h_star_num[j] = ratio^(1 / (2 * s + 3)) * n^(-1 / (2 * s + 3))
             }
@@ -608,14 +562,11 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         }
     }
     else {
-        real scalar dq, A_s, B_s
         dq = (max(q_grid) - min(q_grid)) / (nq - 1)
         if (dq <= 0) dq = 1.0 / nq
         A_s = sum((B_plus - B_minus):^2) * dq
         B_s = sum((V_plus + V_minus)) * dq / f_X_hat
-        real scalar h_val
         if (A_s > 1e-14 && B_s > 0) {
-            real scalar ratio
             ratio = B_s / (2 * (s + 1) * A_s)
             h_val = ratio^(1 / (2 * s + 3)) * n^(-1 / (2 * s + 3))
         }
@@ -625,14 +576,11 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
         h_star_num = J(nq, 1, h_val)
     }
 
-    real scalar h_star_den
     h_star_den = .
     if (is_fuzzy) {
-        real scalar bias_diff_den, var_sum_den
         bias_diff_den = B_plus_den - B_minus_den
         var_sum_den = (V_plus_den + V_minus_den) / f_X_hat
         if (abs(bias_diff_den) > 1e-14 && var_sum_den > 0) {
-            real scalar ratio_den
             ratio_den = var_sum_den / (2 * (s + 1) * (bias_diff_den^2))
             h_star_den = ratio_den^(1 / (2 * s + 3)) * n^(-1 / (2 * s + 3))
         }
@@ -640,7 +588,6 @@ void r3d_bandwidth_select(string scalar xvar, string scalar Qmat,
     }
 
     if (coverage) {
-        real scalar shrink
         shrink = n^(-s / ((2 * s + 3) * (s + 3)))
         h_star_num = h_star_num :* shrink
         if (is_fuzzy) h_star_den = h_star_den * shrink
@@ -669,6 +616,8 @@ real scalar r3d_prepare_bandwidth_matrix(string scalar matname, real scalar nq,
                                         string scalar method)
 {
     real matrix H
+    real scalar unique_count
+
     H = st_matrix(matname)
     if (rows(H) == 1 & cols(H) == 1) {
         H = J(nq, 1, H[1,1])
@@ -681,9 +630,8 @@ real scalar r3d_prepare_bandwidth_matrix(string scalar matname, real scalar nq,
     }
 
     if (method == "frechet") {
-        real scalar unique
-        unique = rows( uniqrows(H) )
-        if (unique > 1) {
+        unique_count = rows( uniqrows(H) )
+        if (unique_count > 1) {
             return(198)
         }
         H = J(nq, 1, H[1,1])
@@ -697,15 +645,20 @@ real scalar r3d_prepare_bandwidth_matrix(string scalar matname, real scalar nq,
 // LOCAL POLYNOMIAL REGRESSION
 // ============================================================================
 
-// Core local polynomial regression
+// Core local polynomial regression with proper intercept weights
+// Computes: alpha = (X'WX)^{-1} X'WY (coefficients)
+//           weights = e_1' (X'WX)^{-1} * basis_i * K(u_i)  (intercept weights)
+// This matches the Fortran plugin (locweights.f90 step 5)
 void r3d_locpoly(real colvector X, real matrix Y, real matrix h_mat,
                 real scalar p, real scalar kernel_type, real scalar side,
                 real matrix alpha, real matrix weights)
 {
     real scalar n, nq, i, j, k
     real matrix XWX, XWY
-    real colvector basis
-    real scalar u, w_i
+    real colvector basis, e1, first_row_inv
+    real scalar u, w_i, w_int
+    real scalar h_j
+    real colvector IPIV
 
     n = rows(X)
     nq = cols(Y)
@@ -726,8 +679,11 @@ void r3d_locpoly(real colvector X, real matrix Y, real matrix h_mat,
     alpha = J(p+1, nq, 0)
     weights = J(n, nq, 0)
 
+    // e_1 vector for extracting first row of inverse
+    e1 = J(p+1, 1, 0)
+    e1[1] = 1
+
     for (j = 1; j <= nq; j++) {
-        real scalar h_j
         h_j = h_mat[j,1]
         if (h_j <= 0) continue
 
@@ -749,9 +705,6 @@ void r3d_locpoly(real colvector X, real matrix Y, real matrix h_mat,
             w_i = r3d_kernel(u, kernel_type)
 
             if (w_i > 0) {
-                // Store weight
-                weights[i,j] = w_i
-
                 // Compute polynomial basis
                 basis = J(p+1, 1, 1)
                 for (k = 2; k <= p+1; k++) {
@@ -767,6 +720,35 @@ void r3d_locpoly(real colvector X, real matrix Y, real matrix h_mat,
         // Solve for coefficients
         if (det(XWX) != 0) {
             alpha[,j] = lusolve(XWX, XWY)
+
+            // Compute first row of (X'WX)^{-1} = solve(XWX, e1)
+            first_row_inv = lusolve(XWX, e1)
+
+            // Compute intercept weights for each observation
+            // w_int_i = (first_row_inv' * basis_i) * K(u_i)
+            // This matches Fortran locweights.f90 lines 131-192
+            for (i = 1; i <= n; i++) {
+                if (side == 1 & X[i] < 0) continue
+                if (side == 0 & X[i] >= 0) continue
+                if (Y[i,j] >= .) continue
+
+                u = X[i] / h_j
+                w_i = r3d_kernel(u, kernel_type)
+
+                if (w_i > 0) {
+                    basis = J(p+1, 1, 1)
+                    for (k = 2; k <= p+1; k++) {
+                        basis[k] = basis[k-1] * (X[i]/h_j)
+                    }
+
+                    // Dot product of first row of inverse with basis, times kernel weight
+                    w_int = 0
+                    for (k = 1; k <= p+1; k++) {
+                        w_int = w_int + first_row_inv[k] * basis[k]
+                    }
+                    weights[i,j] = w_int * w_i
+                }
+            }
         }
         else {
             alpha[,j] = J(p+1, 1, 0)
@@ -781,7 +763,7 @@ void r3d_locpoly(real colvector X, real matrix Y, real matrix h_mat,
 // Pool adjacent violators algorithm for isotonic regression
 real colvector r3d_isotonic(real colvector y)
 {
-    real scalar n, i
+    real scalar n, i, j, sum_y, len, avg, k
     real colvector y_iso
 
     n = rows(y)
@@ -794,7 +776,6 @@ real colvector r3d_isotonic(real colvector y)
     while (i < n) {
         if (y_iso[i] > y_iso[i+1]) {
             // Find violating block
-            real scalar j, sum_y, len
             j = i + 1
             sum_y = y_iso[i] + y_iso[i+1]
             len = 2
@@ -807,7 +788,6 @@ real colvector r3d_isotonic(real colvector y)
             }
 
             // Pool the block
-            real scalar avg, k
             avg = sum_y / len
             for (k = i; k <= j; k++) {
                 y_iso[k] = avg
@@ -845,15 +825,32 @@ void r3d_estimate_core(string scalar method,
                       string scalar denom_name,
                       string scalar touse, real scalar is_fuzzy)
 {
-    real matrix X, Q
+    real matrix X, Q, T
+    real scalar n, nq, j, k, i
+    real matrix h_num_vec
+    real matrix alpha_plus, alpha_minus, w_plus, w_minus
+    real scalar rc_plus, rc_minus
+    real matrix alpha_plus_t, alpha_minus_t, w_plus_t, w_minus_t
+    real matrix h_den_vec
+    real scalar rc_tplus, rc_tminus
+    real matrix e2
+    real scalar denominator
+    real matrix Eplus, Eminus, Eplus_final, Eminus_final
+    real scalar h_j
+    real colvector idxp, idxm
+    real colvector Xscaled, fitted_vals
+    real matrix basis_mat
+    real colvector rowfit
+    real matrix e1
+    real rowvector int_plus, int_minus, tau, se
+    real scalar n_plus, n_minus, var_plus, var_minus
+
     st_view(X, ., xvar, touse)
     Q = st_matrix(Qmat)
 
-    real scalar n, nq
     n = rows(X)
     nq = cols(Q)
 
-    real matrix h_num_vec
     h_num_vec = st_matrix(hnum_matname)
 
     if (rows(h_num_vec) == 1 & cols(h_num_vec) == 1) {
@@ -868,10 +865,7 @@ void r3d_estimate_core(string scalar method,
         return
     }
 
-    real matrix alpha_plus, alpha_minus, w_plus, w_minus
-
     if (r3d_plugin_available()) {
-        real scalar rc_plus, rc_minus
         rc_plus = r3d_plugin_locweights(X, Q, h_num_vec, p, kernel_type, 1, alpha_plus, w_plus)
         rc_minus = r3d_plugin_locweights(X, Q, h_num_vec, p, kernel_type, 0, alpha_minus, w_minus)
         if (rc_plus != 0 | rc_minus != 0) {
@@ -886,21 +880,15 @@ void r3d_estimate_core(string scalar method,
         r3d_locpoly(X, Q, h_num_vec, p, kernel_type, 0, alpha_minus, w_minus)
     }
 
-    real matrix T
-    real matrix alpha_plus_t, alpha_minus_t, w_plus_t, w_minus_t
-    real matrix e2
-    real scalar denominator
     denominator = 1
     e2 = J(n, nq, 0)
 
     if (is_fuzzy) {
         st_view(T, ., tvar, touse)
 
-        real matrix h_den_vec
         h_den_vec = J(1, 1, h_den)
 
         if (r3d_plugin_available()) {
-            real scalar rc_tplus, rc_tminus
             rc_tplus = r3d_plugin_locweights(X, T, h_den_vec, p, kernel_type, 1, alpha_plus_t, w_plus_t)
             rc_tminus = r3d_plugin_locweights(X, T, h_den_vec, p, kernel_type, 0, alpha_minus_t, w_minus_t)
             if (rc_tplus != 0 | rc_tminus != 0) {
@@ -919,44 +907,34 @@ void r3d_estimate_core(string scalar method,
     }
 
     // Predicted values on each side
-    real matrix Eplus, Eminus, Eplus_final, Eminus_final
     Eplus = J(n, nq, .)
     Eminus = J(n, nq, .)
-    real scalar j, k
 
     for (j = 1; j <= nq; j++) {
-        real scalar h_j
         h_j = h_num_vec[j,1]
         if (!(h_j > 0)) continue
 
-        real colvector idxp, idxm
         idxp = (w_plus[,j] :> 0)
         idxm = (w_minus[,j] :> 0)
 
         if (sum(idxp) > 0) {
-            real colvector Xscaled_p
-            real matrix basis_p
-            real colvector fitted_p
-            Xscaled_p = select(X, idxp) / h_j
-            basis_p = J(rows(Xscaled_p), p+1, 1)
+            Xscaled = select(X, idxp) / h_j
+            basis_mat = J(rows(Xscaled), p+1, 1)
             for (k = 2; k <= p+1; k++) {
-                basis_p[,k] = basis_p[,k-1] :* Xscaled_p
+                basis_mat[,k] = basis_mat[,k-1] :* Xscaled
             }
-            fitted_p = basis_p * alpha_plus[,j]
-            Eplus[idxp, j] = fitted_p
+            fitted_vals = basis_mat * alpha_plus[,j]
+            Eplus[idxp, j] = fitted_vals
         }
 
         if (sum(idxm) > 0) {
-            real colvector Xscaled_m
-            real matrix basis_m
-            real colvector fitted_m
-            Xscaled_m = select(X, idxm) / h_j
-            basis_m = J(rows(Xscaled_m), p+1, 1)
+            Xscaled = select(X, idxm) / h_j
+            basis_mat = J(rows(Xscaled), p+1, 1)
             for (k = 2; k <= p+1; k++) {
-                basis_m[,k] = basis_m[,k-1] :* Xscaled_m
+                basis_mat[,k] = basis_mat[,k-1] :* Xscaled
             }
-            fitted_m = basis_m * alpha_minus[,j]
-            Eminus[idxm, j] = fitted_m
+            fitted_vals = basis_mat * alpha_minus[,j]
+            Eminus[idxm, j] = fitted_vals
         }
     }
 
@@ -964,16 +942,13 @@ void r3d_estimate_core(string scalar method,
     Eminus_final = Eminus
 
     if (method == "frechet") {
-        real scalar i
         for (i = 1; i <= n; i++) {
             if (sum(w_plus[i,] :> 0)) {
-                real colvector rowfit
                 rowfit = Eplus[i,]'
                 rowfit = r3d_isotonic(rowfit)
                 Eplus_final[i,] = rowfit'
             }
             if (sum(w_minus[i,] :> 0)) {
-                real colvector rowfit
                 rowfit = Eminus[i,]'
                 rowfit = r3d_isotonic(rowfit)
                 Eminus_final[i,] = rowfit'
@@ -982,10 +957,8 @@ void r3d_estimate_core(string scalar method,
     }
 
     // Residuals for outcome
-    real matrix e1
     e1 = J(n, nq, 0)
     for (j = 1; j <= nq; j++) {
-        real colvector idxp, idxm
         idxp = (w_plus[,j] :> 0)
         idxm = (w_minus[,j] :> 0)
         if (sum(idxp) > 0) {
@@ -998,39 +971,29 @@ void r3d_estimate_core(string scalar method,
 
     // Residuals for treatment (replicated across quantiles)
     if (is_fuzzy) {
-        real colvector idxp, idxm
         idxp = (w_plus_t :> 0)
         idxm = (w_minus_t :> 0)
         if (sum(idxp) > 0) {
-            real colvector Xscaled_p
-            real matrix basis_p
-            real colvector fitted_p, resid_p
-            Xscaled_p = select(X, idxp) / h_den
-            basis_p = J(rows(Xscaled_p), p+1, 1)
+            Xscaled = select(X, idxp) / h_den
+            basis_mat = J(rows(Xscaled), p+1, 1)
             for (k = 2; k <= p+1; k++) {
-                basis_p[,k] = basis_p[,k-1] :* Xscaled_p
+                basis_mat[,k] = basis_mat[,k-1] :* Xscaled
             }
-            fitted_p = basis_p * alpha_plus_t
-            resid_p = select(T, idxp) - fitted_p
-            e2[idxp,] = resid_p * J(1, nq, 1)
+            fitted_vals = basis_mat * alpha_plus_t
+            e2[idxp,] = (select(T, idxp) - fitted_vals) * J(1, nq, 1)
         }
         if (sum(idxm) > 0) {
-            real colvector Xscaled_m
-            real matrix basis_m
-            real colvector fitted_m, resid_m
-            Xscaled_m = select(X, idxm) / h_den
-            basis_m = J(rows(Xscaled_m), p+1, 1)
+            Xscaled = select(X, idxm) / h_den
+            basis_mat = J(rows(Xscaled), p+1, 1)
             for (k = 2; k <= p+1; k++) {
-                basis_m[,k] = basis_m[,k-1] :* Xscaled_m
+                basis_mat[,k] = basis_mat[,k-1] :* Xscaled
             }
-            fitted_m = basis_m * alpha_minus_t
-            resid_m = select(T, idxm) - fitted_m
-            e2[idxm,] = resid_m * J(1, nq, 1)
+            fitted_vals = basis_mat * alpha_minus_t
+            e2[idxm,] = (select(T, idxm) - fitted_vals) * J(1, nq, 1)
         }
     }
 
     // Intercepts and rearrangement/isotonic adjustments
-    real rowvector int_plus, int_minus
     int_plus = alpha_plus[1,]
     int_minus = alpha_minus[1,]
 
@@ -1046,7 +1009,6 @@ void r3d_estimate_core(string scalar method,
     alpha_minus[1,] = int_minus
 
     // Quantile treatment effect
-    real rowvector tau
     tau = int_plus - int_minus
 
     if (is_fuzzy) {
@@ -1059,17 +1021,13 @@ void r3d_estimate_core(string scalar method,
     }
 
     // Standard errors (approximate)
-    real rowvector se
     se = J(1, nq, .)
     for (j = 1; j <= nq; j++) {
-        real colvector idxp, idxm
         idxp = (w_plus[,j] :> 0)
         idxm = (w_minus[,j] :> 0)
-        real scalar n_plus, n_minus
         n_plus = sum(idxp)
         n_minus = sum(idxm)
         if (n_plus > p+1 & n_minus > p+1) {
-            real scalar var_plus, var_minus
             var_plus = r3d_variance(select(e1[,j], idxp))
             var_minus = r3d_variance(select(e1[,j], idxm))
             if (var_plus >= 0 & var_minus >= 0) {
@@ -1174,11 +1132,46 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
                   string scalar touse, real scalar is_fuzzy)
 {
     real matrix X
+    real scalar n, nq, b, j, r
+    real matrix h_num_vec
+    real matrix alpha_plus, alpha_minus, w_plus, w_minus
+    real matrix e1_mat, e2_mat
+    real rowvector int_plus, int_minus, tau_orig, num_diff
+    real scalar denominator
+    real matrix e1_w_plus, e1_w_minus, e2_w_plus, e2_w_minus
+    real scalar is_vector_h_num
+    string rowvector tests_tokens, filtered
+    real scalar do_nullity, do_homogeneity, do_gini
+    real matrix tau_boot, nu_plus_store, nu_minus_store
+    real colvector xi
+    real rowvector plus_sums, minus_sums, out_sharp
+    real scalar denom_term
+    real rowvector top
+    real colvector supvals, sup_sorted
+    real scalar prob, alpha_level, index_c, cval
+    real rowvector cb_lower, cb_upper, q_grid
+    real matrix range_pairs
+    real rowvector range_tokens
+    real scalar n_pairs, idx
+    real scalar range_lo, range_hi
+    real colvector range_idx
+    real matrix pvals
+    real scalar test_stat_null
+    real colvector supvals_null, sup_null_sorted
+    real scalar idx_null, crit_null, p_null
+    real scalar test_stat_homo
+    real rowvector range_tau, draw
+    real scalar mbar, draw_mean
+    real colvector supvals_homo, sup_homo_sorted
+    real scalar idx_homo, crit_homo, p_homo
+    real scalar gini_above, gini_below, gini_diff, test_stat_gini
+    real colvector gini_boot, gini_sorted
+    real rowvector boot_plus, boot_minus
+    real scalar idx_gini, crit_gini, p_gini
+
     st_view(X, ., xvar, touse)
-    real scalar n
     n = rows(X)
 
-    real matrix h_num_vec
     h_num_vec = st_matrix(hnum_matname)
     if (rows(h_num_vec) == 1 & cols(h_num_vec) == 1) {
         h_num_vec = J(cols(st_matrix(tau_name)), 1, h_num_vec[1,1])
@@ -1187,52 +1180,40 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
         h_num_vec = h_num_vec'
     }
 
-    real matrix alpha_plus, alpha_minus, w_plus, w_minus
     alpha_plus = st_matrix(alpha_plus_name)
     alpha_minus = st_matrix(alpha_minus_name)
     w_plus = st_matrix(w_plus_name)
     w_minus = st_matrix(w_minus_name)
 
-    real matrix e1_mat
     e1_mat = st_matrix(e1_name)
 
-    real rowvector int_plus, int_minus, tau_orig
     int_plus = st_matrix(int_plus_name)
     int_minus = st_matrix(int_minus_name)
     tau_orig = st_matrix(tau_name)
 
-    real scalar denominator
     denominator = st_numscalar(denom_name)
 
-    real scalar nq
     nq = cols(alpha_plus)
 
-    real matrix e1_w_plus, e1_w_minus
     e1_w_plus = e1_mat :* w_plus
     e1_w_minus = e1_mat :* w_minus
 
-    real matrix e2_w_plus, e2_w_minus
     if (is_fuzzy) {
-        real matrix e2_mat
         e2_mat = st_matrix(e2_name)
         e2_w_plus = e2_mat :* w_plus
         e2_w_minus = e2_mat :* w_minus
     }
 
-    real rowvector num_diff
     num_diff = int_plus - int_minus
 
-    real scalar is_vector_h_num
     is_vector_h_num = (method_code == 0)
 
     // Parse tests
     tests_str = strlower(strtrim(subinstr(tests_str, ",", " ", .)))
-    string rowvector tests_tokens
     tests_tokens = tokens(tests_str)
 
-    string rowvector filtered
     filtered = J(1, 0, "")
-    for (real scalar j = 1; j <= cols(tests_tokens); j++) {
+    for (j = 1; j <= cols(tests_tokens); j++) {
         if (tests_tokens[j] != "" & tests_tokens[j] != "none") {
             filtered = filtered , tests_tokens[j]
         }
@@ -1244,7 +1225,6 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
         tests_tokens = J(1, 0, "")
     }
 
-    real scalar do_nullity, do_homogeneity, do_gini
     do_nullity = 0
     do_homogeneity = 0
     do_gini = 0
@@ -1254,19 +1234,14 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
         do_gini = any(tests_tokens :== "gini")
     }
 
-    real matrix tau_boot
     tau_boot = J(B, nq, 0)
 
-    real matrix nu_plus_store, nu_minus_store
     if (do_gini) {
         nu_plus_store = J(B, nq, 0)
         nu_minus_store = J(B, nq, 0)
     }
 
-    real colvector xi
-    real rowvector plus_sums, minus_sums, out_sharp
-
-    for (real scalar b = 1; b <= B; b++) {
+    for (b = 1; b <= B; b++) {
         xi = rnormal(n, 1, 0, 1)
         plus_sums = xi' * e1_w_plus
         minus_sums = xi' * e1_w_minus
@@ -1281,10 +1256,8 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
             tau_boot[b,] = out_sharp
         }
         else {
-            real scalar denom_term
             denom_term = (xi' * e2_w_plus[,1]) - (xi' * e2_w_minus[,1])
             if (abs(denominator) > 1e-8) {
-                real rowvector top
                 top = denominator * out_sharp - num_diff :* denom_term
                 tau_boot[b,] = top / (denominator^2)
             }
@@ -1295,46 +1268,36 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
     }
 
     // Uniform confidence bands
-    real colvector supvals
     supvals = J(B, 1, 0)
-    for (real scalar b = 1; b <= B; b++) {
+    for (b = 1; b <= B; b++) {
         supvals[b] = max(abs(tau_boot[b,]))
     }
 
-    real colvector sup_sorted
     sup_sorted = sort(supvals, 1)
 
-    real scalar prob, alpha_level, index_c
     prob = level / 100
     alpha_level = 1 - prob
     index_c = ceil(prob * (B + 1))
     if (index_c < 1) index_c = 1
     if (index_c > B) index_c = B
 
-    real scalar cval
     cval = sup_sorted[index_c]
 
-    real rowvector cb_lower, cb_upper
     cb_lower = tau_orig - cval
     cb_upper = tau_orig + cval
 
     // Prepare quantile grid and test ranges
-    real rowvector q_grid
     q_grid = strtoreal(tokens(quantiles_str))
 
-    real matrix range_pairs
-    real rowvector range_tokens
     range_tokens = strtoreal(tokens(test_ranges_str))
     if (cols(range_tokens) < 2) {
         range_pairs = (min(q_grid), max(q_grid))
     }
     else {
-        real scalar n_pairs
         n_pairs = floor(cols(range_tokens) / 2)
         range_pairs = J(n_pairs, 2, .)
-        real scalar idx
         idx = 1
-        for (real scalar r = 1; r <= n_pairs; r++) {
+        for (r = 1; r <= n_pairs; r++) {
             range_pairs[r,1] = range_tokens[idx]
             range_pairs[r,2] = range_tokens[idx+1]
             idx = idx + 2
@@ -1342,13 +1305,11 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
     }
 
     // For simplicity, use the first range if multiple provided
-    real scalar range_lo, range_hi
     range_lo = range_pairs[1,1]
     range_hi = range_pairs[1,2]
 
-    real colvector range_idx
     range_idx = J(0, 1, .)
-    for (real scalar j = 1; j <= nq; j++) {
+    for (j = 1; j <= nq; j++) {
         if (q_grid[j] >= range_lo & q_grid[j] <= range_hi) {
             range_idx = range_idx \\ j
         }
@@ -1358,96 +1319,71 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
         range_idx = (1..nq)'
     }
 
-    real matrix pvals
     pvals = J(1, 3, .)
 
     if (do_nullity) {
-        real scalar test_stat_null
         test_stat_null = max(abs(tau_orig[range_idx]'))
 
-        real colvector supvals_null
         supvals_null = J(B, 1, 0)
-        for (real scalar b = 1; b <= B; b++) {
+        for (b = 1; b <= B; b++) {
             supvals_null[b] = max(abs(tau_boot[b, range_idx]'))
         }
 
-        real colvector sup_null_sorted
         sup_null_sorted = sort(supvals_null, 1)
-        real scalar idx_null
         idx_null = ceil(prob * (B + 1))
         if (idx_null < 1) idx_null = 1
         if (idx_null > B) idx_null = B
-        real scalar crit_null
         crit_null = sup_null_sorted[idx_null]
 
-        real scalar p_null
         p_null = mean(supvals_null :>= test_stat_null)
         pvals[1,1] = p_null
     }
 
     if (do_homogeneity) {
-        real scalar test_stat_homo
-        real rowvector range_tau
         range_tau = tau_orig[range_idx]
-        real scalar mbar
         mbar = mean(range_tau)
         test_stat_homo = max(abs(range_tau :- mbar))
 
-        real colvector supvals_homo
         supvals_homo = J(B, 1, 0)
-        for (real scalar b = 1; b <= B; b++) {
-            real rowvector draw
+        for (b = 1; b <= B; b++) {
             draw = tau_boot[b, range_idx]
-            real scalar draw_mean
             draw_mean = mean(draw)
             supvals_homo[b] = max(abs(draw :- draw_mean))
         }
 
-        real colvector sup_homo_sorted
         sup_homo_sorted = sort(supvals_homo, 1)
-        real scalar idx_homo
         idx_homo = ceil(prob * (B + 1))
         if (idx_homo < 1) idx_homo = 1
         if (idx_homo > B) idx_homo = B
 
-        real scalar crit_homo
         crit_homo = sup_homo_sorted[idx_homo]
 
-        real scalar p_homo
         p_homo = mean(supvals_homo :>= test_stat_homo)
         pvals[1,2] = p_homo
     }
 
     if (do_gini) {
-        real scalar gini_above, gini_below, gini_diff
         gini_above = r3d_gini_from_quantile(q_grid, int_plus)
         gini_below = r3d_gini_from_quantile(q_grid, int_minus)
         gini_diff = gini_above - gini_below
 
-        real colvector gini_boot
         gini_boot = J(B, 1, 0)
-        for (real scalar b = 1; b <= B; b++) {
-            real rowvector boot_plus, boot_minus
+        for (b = 1; b <= B; b++) {
             boot_plus = int_plus + nu_plus_store[b,]
             boot_minus = int_minus + nu_minus_store[b,]
             gini_boot[b] = r3d_gini_from_quantile(q_grid, boot_plus) - ///
                            r3d_gini_from_quantile(q_grid, boot_minus)
         }
 
-        real scalar test_stat_gini
         test_stat_gini = abs(gini_diff)
 
-        real colvector gini_sorted
         gini_sorted = sort(abs(gini_boot), 1)
-        real scalar idx_gini
         idx_gini = ceil(prob * (B + 1))
         if (idx_gini < 1) idx_gini = 1
         if (idx_gini > B) idx_gini = B
 
-        real scalar crit_gini
         crit_gini = gini_sorted[idx_gini]
 
-        real scalar p_gini
         p_gini = mean(abs(gini_boot) :>= test_stat_gini)
         pvals[1,3] = p_gini
     }
@@ -1465,7 +1401,8 @@ void r3d_bootstrap(string scalar xvar, string scalar Qmat, string scalar tvar,
 // Calculate Gini coefficient from quantile function
 real scalar r3d_gini_from_quantile(real rowvector quantiles, real rowvector qfunc)
 {
-    real scalar nq, i, mean_val, area, gini
+    real scalar nq, i, mean_val, area, gini, cumulative
+    real rowvector lorenz
 
     nq = cols(quantiles)
     if (nq < 2) return(.)
@@ -1479,9 +1416,7 @@ real scalar r3d_gini_from_quantile(real rowvector quantiles, real rowvector qfun
     if (mean_val <= 0) return(0)
 
     // Calculate Lorenz curve
-    real rowvector lorenz
     lorenz = J(1, nq, 0)
-    real scalar cumulative
     cumulative = 0
 
     for (i = 1; i < nq; i++) {
@@ -1507,8 +1442,9 @@ void r3d_test_gini(string scalar xvar, string scalar Qmat,
                    string scalar pval_name)
 {
     real matrix X, Q
-    real scalar n, nq, gini_plus, gini_minus, diff
+    real scalar n, nq, gini_plus, gini_minus, diff, i, j
     real rowvector quantiles, qfunc_plus, qfunc_minus
+    real colvector idx_plus, idx_minus
 
     // Get data
     st_view(X, ., xvar, touse)
@@ -1518,20 +1454,17 @@ void r3d_test_gini(string scalar xvar, string scalar Qmat,
 
     // Create quantile grid
     quantiles = J(1, nq, 0)
-    real scalar i
     for (i = 1; i <= nq; i++) {
         quantiles[i] = i / (nq + 1)
     }
 
     // Compute average quantile functions above and below cutoff
-    real colvector idx_plus, idx_minus
     idx_plus = (X :>= 0)
     idx_minus = (X :< 0)
 
     qfunc_plus = J(1, nq, 0)
     qfunc_minus = J(1, nq, 0)
 
-    real scalar j
     for (j = 1; j <= nq; j++) {
         qfunc_plus[j] = mean(select(Q[,j], idx_plus))
         qfunc_minus[j] = mean(select(Q[,j], idx_minus))
